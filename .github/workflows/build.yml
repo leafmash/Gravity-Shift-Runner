@@ -1,1 +1,141 @@
+name: Build Android
 
+on:
+  push:
+    paths:
+      - "drop/*.zip"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GODOT_VERSION: "4.3.0"
+  NDK_VERSION: "23.2.8568313"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select dropped zip
+        run: |
+          ZIP=$(git log -1 --name-only --format= --diff-filter=AM -- 'drop/*.zip' | head -n1)
+          if [ -z "$ZIP" ]; then ZIP=$(ls -t drop/*.zip 2>/dev/null | head -n1); fi
+          if [ -z "$ZIP" ]; then echo "No zip found in drop/"; exit 1; fi
+          echo "Using $ZIP"
+          echo "DROP_ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Extract project
+        run: |
+          rm -rf work
+          mkdir -p work
+          unzip -q "$DROP_ZIP" -d work
+          PROJECT_FILE=$(find work -name project.godot -not -path "*/__MACOSX/*" -not -path "*/.godot/*" | head -n1)
+          if [ -z "$PROJECT_FILE" ]; then echo "project.godot not found inside the zip"; exit 1; fi
+          PROJECT_DIR=$(dirname "$PROJECT_FILE")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          if [ ! -f "$PROJECT_DIR/export_presets.cfg" ]; then cp ci/export_presets.cfg "$PROJECT_DIR/export_presets.cfg"; fi
+          sed -i "s/^version\/code=.*/version\/code=${GITHUB_RUN_NUMBER}/" "$PROJECT_DIR/export_presets.cfg"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;${NDK_VERSION}" "cmake;3.10.2.4988404"
+
+      - name: Set up Godot
+        uses: chickensoft-games/setup-godot@v2
+        with:
+          version: ${{ env.GODOT_VERSION }}
+          use-dotnet: false
+          include-templates: true
+
+      - name: Configure Godot for Android
+        run: |
+          godot --version
+          SDK_DIR="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          mkdir -p "$HOME/.config/godot"
+          {
+            echo '[gd_resource type="EditorSettings" format=3]'
+            echo ''
+            echo '[resource]'
+            echo "export/android/android_sdk_path = \"${SDK_DIR}\""
+            echo "export/android/java_sdk_path = \"${JAVA_HOME}\""
+          } > "$HOME/.config/godot/editor_settings-4.tres"
+          cp "$HOME/.config/godot/editor_settings-4.tres" "$HOME/.config/godot/editor_settings-4.3.tres"
+
+      - name: Prepare keystores
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_KEYSTORE_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          DEBUG_KEYSTORE="$RUNNER_TEMP/debug.keystore"
+          keytool -genkeypair -keystore "$DEBUG_KEYSTORE" -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android Debug,O=Android,C=US"
+          {
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$DEBUG_KEYSTORE"
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey"
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android"
+          } >> "$GITHUB_ENV"
+          if [ -n "$RELEASE_KEYSTORE_BASE64" ] && [ -n "$RELEASE_KEY_ALIAS" ] && [ -n "$RELEASE_KEY_PASSWORD" ]; then
+            echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            {
+              echo "GODOT_ANDROID_KEYSTORE_RELEASE_PATH=$RUNNER_TEMP/release.keystore"
+              echo "GODOT_ANDROID_KEYSTORE_RELEASE_USER=$RELEASE_KEY_ALIAS"
+              echo "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD=$RELEASE_KEY_PASSWORD"
+            } >> "$GITHUB_ENV"
+            echo "Release builds will use the keystore from secrets"
+          else
+            {
+              echo "GODOT_ANDROID_KEYSTORE_RELEASE_PATH=$DEBUG_KEYSTORE"
+              echo "GODOT_ANDROID_KEYSTORE_RELEASE_USER=androiddebugkey"
+              echo "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD=android"
+            } >> "$GITHUB_ENV"
+            echo "Release secrets missing: release builds will be signed with the debug keystore"
+          fi
+
+      - name: Import project and install Android build template
+        run: |
+          cd "$PROJECT_DIR"
+          godot --headless --import || true
+          godot --headless --import || true
+          TEMPLATE_ZIP=$(find "$HOME/.local/share/godot" -name android_source.zip | head -n1)
+          if [ -z "$TEMPLATE_ZIP" ]; then echo "android_source.zip not found, export templates missing"; exit 1; fi
+          mkdir -p android/build
+          unzip -q -o "$TEMPLATE_ZIP" -d android/build
+          basename "$(dirname "$TEMPLATE_ZIP")" > android/.build_version
+          touch android/build/.gdignore
+
+      - name: Export APK and AAB
+        run: |
+          OUT="$GITHUB_WORKSPACE/out"
+          mkdir -p "$OUT"
+          cd "$PROJECT_DIR"
+          godot --headless --export-debug "Android APK" "$OUT/GravityShiftRunner-debug.apk"
+          godot --headless --export-release "Android APK" "$OUT/GravityShiftRunner-release.apk"
+          godot --headless --export-release "Android AAB" "$OUT/GravityShiftRunner-release.aab"
+          ls -la "$OUT"
+          test -f "$OUT/GravityShiftRunner-debug.apk"
+          test -f "$OUT/GravityShiftRunner-release.apk"
+          test -f "$OUT/GravityShiftRunner-release.aab"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gravity-shift-runner-android
+          path: out/*
+          if-no-files-found: error
