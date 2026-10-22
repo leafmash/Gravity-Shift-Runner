@@ -49,13 +49,13 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install Android SDK packages
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;${NDK_VERSION}" "cmake;3.10.2.4988404"
+          SDK_DIR="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          SDKMANAGER=$(find "$SDK_DIR/cmdline-tools" -name sdkmanager -type f | sort -r | head -n1)
+          if [ -z "$SDKMANAGER" ]; then echo "sdkmanager not found in $SDK_DIR"; exit 1; fi
+          yes | "$SDKMANAGER" --sdk_root="$SDK_DIR" --licenses > /dev/null || true
+          "$SDKMANAGER" --sdk_root="$SDK_DIR" "platforms;android-34" "build-tools;34.0.0" "ndk;${NDK_VERSION}" "cmake;3.10.2.4988404"
 
       - name: Set up Godot
         uses: chickensoft-games/setup-godot@v2
