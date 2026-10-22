@@ -12,6 +12,7 @@ permissions:
 env:
   GODOT_VERSION: "4.3.0"
   NDK_VERSION: "23.2.8568313"
+  LOG_DIR: ${{ github.workspace }}/logs
 
 jobs:
   build:
@@ -23,11 +24,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Prepare log folder
+        run: mkdir -p "$LOG_DIR"
+
       - name: Select dropped zip
         run: |
           ZIP=$(git log -1 --name-only --format= --diff-filter=AM -- 'drop/*.zip' | head -n1)
           if [ -z "$ZIP" ]; then ZIP=$(ls -t drop/*.zip 2>/dev/null | head -n1); fi
-          if [ -z "$ZIP" ]; then echo "No zip found in drop/"; exit 1; fi
+          if [ -z "$ZIP" ]; then echo "::error title=No zip::No zip file found inside the drop folder"; exit 1; fi
           echo "Using $ZIP"
           echo "DROP_ZIP=$ZIP" >> "$GITHUB_ENV"
 
@@ -37,7 +41,7 @@ jobs:
           mkdir -p work
           unzip -q "$DROP_ZIP" -d work
           PROJECT_FILE=$(find work -name project.godot -not -path "*/__MACOSX/*" -not -path "*/.godot/*" | head -n1)
-          if [ -z "$PROJECT_FILE" ]; then echo "project.godot not found inside the zip"; exit 1; fi
+          if [ -z "$PROJECT_FILE" ]; then echo "::error title=Bad zip::project.godot was not found inside $DROP_ZIP"; exit 1; fi
           PROJECT_DIR=$(dirname "$PROJECT_FILE")
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           if [ ! -f "$PROJECT_DIR/export_presets.cfg" ]; then cp ci/export_presets.cfg "$PROJECT_DIR/export_presets.cfg"; fi
@@ -53,9 +57,9 @@ jobs:
         run: |
           SDK_DIR="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
           SDKMANAGER=$(find "$SDK_DIR/cmdline-tools" -name sdkmanager -type f | sort -r | head -n1)
-          if [ -z "$SDKMANAGER" ]; then echo "sdkmanager not found in $SDK_DIR"; exit 1; fi
+          if [ -z "$SDKMANAGER" ]; then echo "::error title=Android SDK::sdkmanager not found in $SDK_DIR"; exit 1; fi
           yes | "$SDKMANAGER" --sdk_root="$SDK_DIR" --licenses > /dev/null || true
-          "$SDKMANAGER" --sdk_root="$SDK_DIR" "platforms;android-34" "build-tools;34.0.0" "ndk;${NDK_VERSION}" "cmake;3.10.2.4988404"
+          "$SDKMANAGER" --sdk_root="$SDK_DIR" "platforms;android-34" "build-tools;34.0.0" "ndk;${NDK_VERSION}" "cmake;3.10.2.4988404" 2>&1 | tee "$LOG_DIR/sdk-install.log"
 
       - name: Set up Godot
         uses: chickensoft-games/setup-godot@v2
@@ -108,30 +112,65 @@ jobs:
             echo "Release secrets missing: release builds will be signed with the debug keystore"
           fi
 
-      - name: Import project and install Android build template
+      - name: Import project
         run: |
           cd "$PROJECT_DIR"
-          godot --headless --import || true
-          godot --headless --import || true
+          godot --headless --import 2>&1 | tee "$LOG_DIR/import-1.log" || true
+          godot --headless --import 2>&1 | tee "$LOG_DIR/import-2.log" || true
+
+      - name: Install Android build template
+        run: |
+          cd "$PROJECT_DIR"
           TEMPLATE_ZIP=$(find "$HOME/.local/share/godot" -name android_source.zip | head -n1)
-          if [ -z "$TEMPLATE_ZIP" ]; then echo "android_source.zip not found, export templates missing"; exit 1; fi
+          if [ -z "$TEMPLATE_ZIP" ]; then echo "::error title=Export templates::android_source.zip not found, Godot export templates are missing"; exit 1; fi
           mkdir -p android/build
           unzip -q -o "$TEMPLATE_ZIP" -d android/build
           basename "$(dirname "$TEMPLATE_ZIP")" > android/.build_version
           touch android/build/.gdignore
 
-      - name: Export APK and AAB
+      - name: Export debug APK
         run: |
-          OUT="$GITHUB_WORKSPACE/out"
-          mkdir -p "$OUT"
+          mkdir -p "$GITHUB_WORKSPACE/out"
           cd "$PROJECT_DIR"
-          godot --headless --export-debug "Android APK" "$OUT/GravityShiftRunner-debug.apk"
-          godot --headless --export-release "Android APK" "$OUT/GravityShiftRunner-release.apk"
-          godot --headless --export-release "Android AAB" "$OUT/GravityShiftRunner-release.aab"
-          ls -la "$OUT"
-          test -f "$OUT/GravityShiftRunner-debug.apk"
-          test -f "$OUT/GravityShiftRunner-release.apk"
-          test -f "$OUT/GravityShiftRunner-release.aab"
+          godot --headless --export-debug "Android APK" "$GITHUB_WORKSPACE/out/GravityShiftRunner-debug.apk" 2>&1 | tee "$LOG_DIR/export-debug-apk.log"
+          test -f "$GITHUB_WORKSPACE/out/GravityShiftRunner-debug.apk"
+
+      - name: Export release APK
+        run: |
+          cd "$PROJECT_DIR"
+          godot --headless --export-release "Android APK" "$GITHUB_WORKSPACE/out/GravityShiftRunner-release.apk" 2>&1 | tee "$LOG_DIR/export-release-apk.log"
+          test -f "$GITHUB_WORKSPACE/out/GravityShiftRunner-release.apk"
+
+      - name: Export release AAB
+        run: |
+          cd "$PROJECT_DIR"
+          godot --headless --export-release "Android AAB" "$GITHUB_WORKSPACE/out/GravityShiftRunner-release.aab" 2>&1 | tee "$LOG_DIR/export-release-aab.log"
+          test -f "$GITHUB_WORKSPACE/out/GravityShiftRunner-release.aab"
+
+      - name: Show main error
+        if: failure()
+        run: |
+          shopt -s nullglob
+          echo "## Build failed" >> "$GITHUB_STEP_SUMMARY"
+          FOUND=0
+          for LOG in "$LOG_DIR"/*.log; do
+            NAME=$(basename "$LOG")
+            MATCHES=$(grep -n -A1 -E "SCRIPT ERROR|Parse Error|ERROR:|FAILURE:|What went wrong|error:|Exception|No such file|not found" "$LOG" | head -n 16 || true)
+            if [ -n "$MATCHES" ]; then
+              FOUND=1
+              echo "### $NAME" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              echo "$MATCHES" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              MESSAGE=$(echo "$MATCHES" | head -n 8 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+              echo "::error title=Main error in $NAME::$MESSAGE"
+              echo "===== $NAME ====="
+              echo "$MATCHES"
+            fi
+          done
+          if [ "$FOUND" = "0" ]; then
+            echo "::error title=Build failed::Open the red step above to read its log"
+          fi
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -139,3 +178,11 @@ jobs:
           name: gravity-shift-runner-android
           path: out/*
           if-no-files-found: error
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: logs/*
+          if-no-files-found: ignore
